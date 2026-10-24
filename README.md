@@ -145,13 +145,91 @@ The TV response contains sensitive values such as its device ID, LG authenticati
 
 Do not publish debug logs without reviewing them first. Never commit SSH private keys, downloaded proprietary IPKs, temporary signed URLs, cookies, or device headers.
 
-## NCG and installation
+## Installing a downloaded IPK
 
-Many official LG packages contain files encrypted with LG's NCG DRM. Downloading an IPK does not automatically grant the TV the rights required to run it.
+There is no single installation method that works for every IPK. Choose the method according to the package type:
 
-Installing an encrypted official package with the development installer may place it under `/media/developer/apps`, where its encrypted entry point can fail to load. A normal store installation typically uses `/media/cryptofs/apps` and registers NCG rights through webOS system services.
+| Package type | Recommended method | Expected result |
+| --- | --- | --- |
+| Your own webOS app | `ares-install` or webOS Dev Manager | Normally works through Developer Mode. |
+| Homebrew or another unencrypted community package | Homebrew Channel, webOS Dev Manager, `ares-install`, or the Luna command below | Normally works on a compatible TV. |
+| Official LG Content Store package without protected content | A development installer may work, but this is not guaranteed | Try the methods below and test the application. |
+| Official LG Content Store package protected with NCG | Install it from LG Content Store in a supported region | Sideloading may report success, but the application can still fail to launch. |
 
-This downloader intentionally does not automate that process.
+webOS Dev Manager, `ares-install`, and the direct Luna command are different front ends for the development installation flow. They are useful alternatives when a connection or client tool fails, but they do not bypass NCG protection.
+
+Only install IPKs from sources you trust. An IPK can contain application code and services that run on the TV.
+
+### Option 1: webOS Dev Manager
+
+[webOS Dev Manager](https://github.com/webosbrew/dev-manager-desktop) provides a graphical interface and supports both Developer Mode TVs and rooted TVs. Add the TV, connect to it, and use the application installation action to select the downloaded IPK.
+
+This is usually the easiest option for Homebrew packages. On a rooted TV, configure the connection with the TV address, SSH port `22`, and the `root` user. Do not share the private key or password used for that connection.
+
+### Option 2: official webOS CLI
+
+Install LG's current command-line tools:
+
+```bash
+npm install -g @webos-tools/cli
+```
+
+Configure the TV with `ares-setup-device`, then install and verify the package:
+
+```bash
+ares-setup-device
+ares-install --device myTV ./com.example.app_1.0.0_all.ipk
+ares-install --device myTV --list
+ares-launch --device myTV com.example.app
+```
+
+On a non-rooted TV this requires the LG Developer Mode app, its SSH key, and an active Developer Mode session. Apps installed this way are development apps and may be removed when Developer Mode expires.
+
+### Option 3: install directly over root SSH
+
+On a rooted TV, copy the package to a temporary location:
+
+```bash
+scp -O ./com.example.app_1.0.0_all.ipk root@192.168.1.80:/tmp/app.ipk
+ssh root@192.168.1.80
+```
+
+Then run this command on the TV:
+
+```bash
+luna-send-pub -i -f \
+  luna://com.webos.appInstallService/dev/install \
+  '{"id":"com.ares.defaultName","ipkUrl":"/tmp/app.ipk","subscribe":true}'
+```
+
+Wait for the subscription output to report that installation has finished. The value passed as `id` above is the conventional placeholder used by development installers; the actual application ID is read from the package.
+
+This direct method uses the same development installer as `ares-install`. It is useful for diagnosing client-side problems, but it does not make a protected store package behave like a normal Content Store installation.
+
+Do not use `opkg install` for these files. Although both use the `.ipk` extension, webOS application packages must be registered through the application installer. Manually extracting or copying an application directory also skips registration and is not a complete installation.
+
+### Option 4: Homebrew Channel
+
+If the application is available in [Homebrew Channel](https://github.com/webosbrew/webos-homebrew-channel), installing it there is preferable to manually sideloading its IPK. Homebrew Channel manages its catalog, package hashes, installation, and updates. It ultimately uses the development installer for ordinary Homebrew packages.
+
+### Official store packages and NCG
+
+Many official LG packages contain files encrypted with LG's NCG protection. Downloading the IPK does not grant the TV the rights required to decrypt and run those files.
+
+A development installation normally places an app under `/media/developer/apps`. Content Store apps are normally installed under `/media/cryptofs/apps`, with the required rights handled by LG's store and DRM services. Consequently, an encrypted IPK can be accepted by `ares-install` or `dev/install` and appear in the launcher, but still show a blank screen, immediately close, or fail to load its entry point.
+
+There is no supported command that turns a downloaded protected IPK into a licensed Content Store installation. The reliable method for such a package is installing it through LG Content Store on a supported TV and region. This downloader intentionally does not decrypt content, obtain DRM keys, or reproduce the protected store installation flow.
+
+### What to try when an installed app does not work
+
+1. Confirm that the package was built for your TV's webOS version and architecture.
+2. Check whether the application appears in `ares-install --device myTV --list`.
+3. Launch it from the command line with `ares-launch` and inspect the returned error.
+4. If it is a Homebrew package, try Homebrew Channel or webOS Dev Manager instead of a manual command.
+5. If it is an official store package, assume NCG may be involved even when installation reported success.
+6. If the app opens but displays a network error, verify DNS, TLS certificates, the TV clock, and whether the application's own service is restricted by account or region. This is different from an IPK installation failure.
+
+The commands above follow the [LG webOS CLI developer guide](https://webostv.developer.lge.com/develop/tools/cli-dev-guide), the [LG Developer Mode documentation](https://webostv.developer.lge.com/develop/getting-started/developer-mode-app), and the [webOS Homebrew installation guidance](https://www.webosbrew.org/pages/commands-cheatsheet).
 
 ## Known limitations
 
