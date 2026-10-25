@@ -14,6 +14,7 @@ import html
 import json
 import os
 import re
+import ssl
 import subprocess
 import sys
 import unicodedata
@@ -215,6 +216,8 @@ def request_from_tv(
         "request = POST",
         f"data = {curl_quote(urllib.parse.urlencode(data))}",
     ]
+    if args.insecure:
+        config.append("insecure")
     for name, value in headers.items():
         config.append(f"header = {curl_quote(f'{name}: {value}')}")
 
@@ -232,19 +235,39 @@ def request_from_tv(
 
     if result.returncode != 0:
         detail = result.stderr.decode("utf-8", errors="replace").strip()
-        raise ToolError(f"The regional request from the TV failed: {detail}")
+        raise ToolError(
+            f"The regional request from the TV failed: {detail}. "
+            "If the TV cannot reach LG, try --init-from-computer"
+        )
     return parse_json(result.stdout.decode("utf-8", errors="replace"))
 
 
+def ssl_context_for(args: argparse.Namespace) -> ssl.SSLContext | None:
+    if args.insecure:
+        return ssl._create_unverified_context()
+    if args.ca_bundle:
+        try:
+            return ssl.create_default_context(cafile=str(args.ca_bundle.expanduser()))
+        except (OSError, ssl.SSLError) as exc:
+            raise ToolError(f"Could not load CA bundle: {exc}") from exc
+    return None
+
+
 def create_regional_session(
-    args: argparse.Namespace, headers: dict[str, str], country: str
+    args: argparse.Namespace,
+    headers: dict[str, str],
+    country: str,
+    ssl_context: ssl.SSLContext | None,
 ) -> str:
-    response = request_from_tv(
-        args,
-        f"https://{country}.lgtvsdp.com/rest/sdp/v11.2/initservices",
-        headers,
-        {"api_info": "auth:Y,provisioning:N,services:N,appupdatecheck:N"},
-    )
+    url = f"https://{country}.lgtvsdp.com/rest/sdp/v11.2/initservices"
+    data = {"api_info": "auth:Y,provisioning:N,services:N,appupdatecheck:N"}
+    if args.init_from_computer:
+        response = http_json(
+            url, headers=headers, data=data, timeout=args.timeout,
+            ssl_context=ssl_context,
+        )
+    else:
+        response = request_from_tv(args, url, headers, data)
     session = find_value(response, {"sessionID", "sessionId", "session_id"})
     if not isinstance(session, str) or not session:
         message = find_value(response, {"message", "errorMessage", "error"})
@@ -258,6 +281,7 @@ def http_json(
     headers: dict[str, str] | None = None,
     data: dict[str, str] | None = None,
     timeout: int,
+    ssl_context: ssl.SSLContext | None = None,
 ) -> Any:
     request_headers = {"User-Agent": USER_AGENT, **(headers or {})}
     body = None
@@ -268,7 +292,7 @@ def http_json(
         )
     request = urllib.request.Request(url, data=body, headers=request_headers)
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with urllib.request.urlopen(request, timeout=timeout, context=ssl_context) as response:
             return parse_json(response.read().decode("utf-8", errors="replace"))
     except urllib.error.HTTPError as exc:
         payload = exc.read().decode("utf-8", errors="replace")
@@ -282,15 +306,24 @@ def http_json(
             f"HTTP {exc.code} while querying {url}: {message or exc.reason}"
         ) from exc
     except urllib.error.URLError as exc:
+        if isinstance(exc.reason, ssl.SSLCertVerificationError):
+            raise ToolError(
+                f"TLS certificate verification failed for {url}: {exc.reason}. "
+                "Check the computer's CA certificates or use --ca-bundle PATH"
+            ) from exc
         raise ToolError(f"Could not connect to {url}: {exc.reason}") from exc
 
 
-def get_public_metadata(app_no: str, country: str, timeout: int) -> dict[str, str]:
+def get_public_metadata(
+    app_no: str, country: str, timeout: int,
+    ssl_context: ssl.SSLContext | None = None,
+) -> dict[str, str]:
     response = http_json(
         f"https://{country.casefold()}.lgappstv.com/api/tvapp/retrieveAppInfo.ajax",
         headers={"Referer": f"https://{country.casefold()}.lgappstv.com/"},
         data={"appId": app_no},
         timeout=timeout,
+        ssl_context=ssl_context,
     )
     products = response.get("prodInfo") if isinstance(response, dict) else None
     if not isinstance(products, list) or not products or not isinstance(products[0], dict):
@@ -349,6 +382,7 @@ def resolve_app_id(
     headers: dict[str, str],
     timeout: int,
     verbose: bool,
+    ssl_context: ssl.SSLContext | None = None,
 ) -> str:
     wanted = normalize_name(metadata["name"])
     category = metadata["category"]
@@ -372,6 +406,7 @@ def resolve_app_id(
             f"{base}/discovery/item/GAMESAPPS?{query}",
             headers=headers,
             timeout=timeout,
+            ssl_context=ssl_context,
         )
         candidates = collect_apps(payload)
         new_count = 0
@@ -405,13 +440,14 @@ def store_request(
     timeout: int,
     *,
     stub: bool = False,
+    ssl_context: ssl.SSLContext | None = None,
 ) -> Any:
     params: dict[str, str] = {"app_id": app_id}
     if stub:
         params["stub"] = "N"
     query = urllib.parse.urlencode(params)
     url = f"https://{country}.tvsdp.lgeapi.com/lgstore/7.0/{path}?{query}"
-    response = http_json(url, headers=headers, timeout=timeout)
+    response = http_json(url, headers=headers, timeout=timeout, ssl_context=ssl_context)
     message = find_value(response, {"errorMessage"})
     if message:
         raise ToolError(str(message))
@@ -449,6 +485,7 @@ def download(
     expected_size: int | None,
     timeout: int,
     force: bool,
+    ssl_context: ssl.SSLContext | None = None,
 ) -> tuple[int, str]:
     output = output.resolve()
     if output.exists() and not force:
@@ -462,7 +499,7 @@ def download(
     size = 0
     request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response, partial.open(
+        with urllib.request.urlopen(request, timeout=timeout, context=ssl_context) as response, partial.open(
             "wb"
         ) as destination:
             while block := response.read(1024 * 1024):
@@ -477,6 +514,15 @@ def download(
                 f"Unexpected size: expected {expected_size} bytes, received {size}"
             )
         partial.replace(output)
+    except urllib.error.URLError as exc:
+        if partial.exists():
+            partial.unlink()
+        if isinstance(exc.reason, ssl.SSLCertVerificationError):
+            raise ToolError(
+                f"TLS certificate verification failed for the package download: {exc.reason}. "
+                "Check the computer's CA certificates or use --ca-bundle PATH"
+            ) from exc
+        raise ToolError(f"Could not download the package: {exc.reason}") from exc
     except Exception:
         if partial.exists():
             partial.unlink()
@@ -536,6 +582,20 @@ def parser() -> argparse.ArgumentParser:
         "--force", "-f", action="store_true", help="Replace an existing output file"
     )
     result.add_argument(
+        "--init-from-computer",
+        action="store_true",
+        help="Create the regional session on this computer instead of the TV",
+    )
+    tls = result.add_mutually_exclusive_group()
+    tls.add_argument(
+        "--ca-bundle", type=Path, metavar="PATH",
+        help="CA certificate bundle for HTTPS requests from this computer",
+    )
+    tls.add_argument(
+        "--insecure", action="store_true",
+        help="Disable HTTPS certificate verification (unsafe)",
+    )
+    result.add_argument(
         "--verbose", "-v", action="store_true", help="Show progress information"
     )
     return result
@@ -549,12 +609,15 @@ def main(argv: list[str] | None = None) -> int:
         if args.timeout <= 0:
             raise ToolError("--timeout must be greater than zero")
         app_ref, country = parse_target(args.target, args.country)
+        ssl_context = ssl_context_for(args)
+        if args.insecure:
+            print("Warning: HTTPS certificate verification is disabled", file=sys.stderr)
 
         log(f"Querying TV {args.tv}", args.verbose)
         device = get_device_info(args)
         bootstrap = make_device_headers(device, country)
         log(f"Creating a temporary store session for {country}", args.verbose)
-        session = create_regional_session(args, bootstrap, country)
+        session = create_regional_session(args, bootstrap, country, ssl_context)
         headers = dict(bootstrap)
         set_header(headers, "X-Authentication", session)
         set_header(headers, "X-Lge-AppKey", args.app_key)
@@ -562,10 +625,10 @@ def main(argv: list[str] | None = None) -> int:
 
         metadata: dict[str, str] = {}
         if app_ref.isdigit():
-            metadata = get_public_metadata(app_ref, country, args.timeout)
+            metadata = get_public_metadata(app_ref, country, args.timeout, ssl_context)
             log(f"Resolving the internal ID for {metadata['name']}", args.verbose)
             app_id = resolve_app_id(
-                metadata, country, headers, args.timeout, args.verbose
+                metadata, country, headers, args.timeout, args.verbose, ssl_context
             )
         else:
             app_id = app_ref
@@ -576,6 +639,7 @@ def main(argv: list[str] | None = None) -> int:
             app_id,
             headers,
             args.timeout,
+            ssl_context=ssl_context,
         )
         install = store_request(
             country,
@@ -584,6 +648,7 @@ def main(argv: list[str] | None = None) -> int:
             headers,
             args.timeout,
             stub=True,
+            ssl_context=ssl_context,
         )
         file_url = find_value(install, {"fileURL", "fileUrl", "file_url"})
         if not isinstance(file_url, str) or not file_url.startswith(("http://", "https://")):
@@ -597,7 +662,7 @@ def main(argv: list[str] | None = None) -> int:
         output = choose_output(args.output, app_id, version)
         log(f"Downloading {output.name}", args.verbose)
         size, checksum = download(
-            file_url, output, expected_size, args.timeout, args.force
+            file_url, output, expected_size, args.timeout, args.force, ssl_context
         )
 
         print(f"File: {output.resolve()}")

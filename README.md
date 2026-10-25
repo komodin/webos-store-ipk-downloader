@@ -25,9 +25,9 @@ The script only downloads packages. It does not install applications, decrypt NC
 - A rooted LG webOS TV.
 - SSH access to the TV.
 - Public-key authentication or a configured SSH agent.
-- `luna-send` and `curl` available on the TV.
+- `luna-send` available on the TV. The default regional initialization method also needs `curl` on the TV.
 - The computer and TV must be able to reach each other over the network.
-- Internet access from both the computer and the TV.
+- Internet access from the computer. By default the TV also needs access to the regional initialization endpoint.
 
 Before running the script, verify that SSH works without an interactive password prompt:
 
@@ -56,7 +56,8 @@ usage: webos_ipk.py [-h] --tv USER@HOST [--country XX]
                     [--identity-file IDENTITY_FILE]
                     [--ssh-option KEY=VALUE] [--app-key APP_KEY]
                     [--output OUTPUT] [--timeout TIMEOUT]
-                    [--force] [--verbose]
+                    [--force] [--init-from-computer]
+                    [--ca-bundle PATH | --insecure] [--verbose]
                     target
 ```
 
@@ -74,6 +75,9 @@ usage: webos_ipk.py [-h] --tv USER@HOST [--country XX]
 | `--output PATH` | `-o` | Output file or an existing output directory. |
 | `--timeout SECONDS` | `-T` | Network and SSH timeout. Defaults to `30`. |
 | `--force` | `-f` | Replace an existing output file. |
+| `--init-from-computer` | | Send the regional initialization request from the computer when the TV cannot reach LG. Device headers still come from the TV over SSH. |
+| `--ca-bundle PATH` | | Use a specified CA certificate bundle for HTTPS requests from the computer. |
+| `--insecure` | | Disable HTTPS certificate verification for computer requests and the TV's regional request. Use only as a last resort. |
 | `--verbose` | `-v` | Print progress information. |
 
 `-T` is used for `--timeout` because `-t` is already assigned to `--tv`.
@@ -125,7 +129,7 @@ An internal store ID can also be used, but it still requires `--country`.
    ```
 
 3. The TV returns the device headers normally used by LG services. These include device metadata, an authentication value, and a store cookie.
-4. Using those headers, `curl` runs on the TV and requests a temporary session from the regional `initservices` endpoint.
+4. Using those headers, `curl` runs on the TV and requests a temporary session from the regional `initservices` endpoint. With `--init-from-computer`, Python makes this request from the computer instead.
 5. For a numeric ID, the public LG Apps metadata endpoint provides the application name and category. The regional TV API is then searched for the internal application ID.
 6. The script requests application details and installation metadata from the regional `/lgstore/7.0` API.
 7. LG returns a signed package URL and the expected package size.
@@ -133,12 +137,23 @@ An internal store ID can also be used, but it still requires `--country`.
 
 The regional session is temporary. The script does not update the country stored in webOS settings.
 
+## Running the tests
+
+`test_webos_ipk.py` contains the regression tests for regional initialization and HTTPS certificate handling. It checks that initialization can run on the computer or the TV, that custom CA bundles and `--insecure` configure TLS as requested, and that certificate failures produce useful errors. The tests mock network and SSH calls, so they do not require a TV or download an IPK.
+
+Run them with Python's standard library test runner:
+
+```bash
+python3 -B -m unittest -v
+```
+
 ## Security and privacy
 
 The TV response contains sensitive values such as its device ID, LG authentication value, and cookies. The script:
 
 - Keeps these values in memory.
 - Sends the regional request configuration to remote `curl` through SSH standard input.
+- With `--init-from-computer`, sends the same device headers directly to LG over HTTPS from the computer.
 - Does not place authentication headers in command-line arguments.
 - Does not print authentication headers, cookies, or the device ID.
 - Does not write session data to disk.
@@ -277,6 +292,33 @@ python3 webos_ipk.py 95384 \
   -s StrictHostKeyChecking=yes \
   -s UserKnownHostsFile=~/.ssh/known_hosts
 ```
+
+### The TV cannot reach the regional initialization endpoint
+
+If the regional request fails with a timeout or a network error while SSH and the TV's Content Store still work, create the session from the computer:
+
+```bash
+python3 webos_ipk.py \
+  'https://de.lgappstv.com/main/tvapp/detail?appId=95384' \
+  -t root@192.168.1.80 \
+  --init-from-computer
+```
+
+### macOS reports a certificate verification failure
+
+The Python installation may be missing a usable CA certificate bundle. Check the computer's date and certificate setup first. If you have a trusted PEM bundle, pass it with `--ca-bundle /path/to/cacert.pem`. This applies to the regional request, catalog queries, and package download made by the computer.
+
+For the case where the TV cannot reach the regional endpoint and Python needs a CA bundle, use both options:
+
+```bash
+python3 webos_ipk.py \
+  'https://de.lgappstv.com/main/tvapp/detail?appId=95384' \
+  -t root@192.168.1.80 \
+  --init-from-computer \
+  --ca-bundle /path/to/cacert.pem
+```
+
+If you need to proceed while investigating the certificate problem, `--insecure` disables HTTPS certificate verification and prints a warning. It also affects the TV's regional request when that method is used. This exposes device authentication headers and package downloads to interception, so avoid using it on untrusted networks.
 
 ## Responsible use
 
